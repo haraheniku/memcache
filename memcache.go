@@ -2,6 +2,7 @@
 package memcache
 
 import (
+	"bufio"
 	"encoding/binary"
 	"errors"
 	"io"
@@ -112,6 +113,7 @@ const (
 
 // Conn is a network connection to memcached.
 type Conn struct {
+	rw   *bufio.ReadWriter
 	conn net.Conn
 }
 
@@ -124,7 +126,10 @@ func Connect(network, addr string) (*Conn, error) {
 }
 
 func New(conn net.Conn) *Conn {
-	return &Conn{conn}
+	return &Conn{
+		rw:   bufio.NewReadWriter(bufio.NewReader(conn), bufio.NewWriter(conn)),
+		conn: conn,
+	}
 }
 
 func writeHeader(buf []byte, op byte, keyLen uint16, extraLen byte,
@@ -163,7 +168,7 @@ func (r *resp) statusError() error {
 }
 
 func (c *Conn) readResp(buf []byte) (r resp, err error) {
-	if _, err = io.ReadAtLeast(c.conn, buf[:24], 24); err != nil {
+	if _, err = io.ReadAtLeast(c.rw, buf[:24], 24); err != nil {
 		return
 	}
 	if buf[0] != magicRes { // check magic byte
@@ -181,7 +186,7 @@ func (c *Conn) readResp(buf []byte) (r resp, err error) {
 
 	if r.bodyLen > 0 {
 		r.body = make([]byte, r.bodyLen)
-		if _, err = io.ReadAtLeast(c.conn, r.body, int(r.bodyLen)); err != nil {
+		if _, err = io.ReadAtLeast(c.rw, r.body, int(r.bodyLen)); err != nil {
 			return
 		}
 	}
@@ -190,13 +195,18 @@ func (c *Conn) readResp(buf []byte) (r resp, err error) {
 
 func (c *Conn) Get(key string) (*Item, error) {
 	var (
-		buf     = make([]byte, 24+len(key))
+		buf     = make([]byte, 24)
 		keyLen  = uint16(len(key))
 		bodyLen = uint32(len(key))
 	)
 	writeHeader(buf, opGet, keyLen, 0, 0, bodyLen, 0)
-	copy(buf[24:], key)
-	if _, err := c.conn.Write(buf); err != nil {
+	if _, err := c.rw.Write(buf); err != nil {
+		return nil, err
+	}
+	if _, err := c.rw.WriteString(key); err != nil {
+		return nil, err
+	}
+	if err := c.rw.Flush(); err != nil {
 		return nil, err
 	}
 
@@ -223,7 +233,7 @@ func (c *Conn) Get(key string) (*Item, error) {
 func (c *Conn) set(op byte, cas bool, item *Item) error {
 	var (
 		casid   = uint64(0)
-		buf     = make([]byte, 24+8+len(item.Key))
+		buf     = make([]byte, 24+8)
 		keyLen  = uint16(len(item.Key))
 		bodyLen = uint32(8 + len(item.Key) + len(item.Value))
 	)
@@ -231,14 +241,18 @@ func (c *Conn) set(op byte, cas bool, item *Item) error {
 		casid = uint64(item.casid)
 	}
 	writeHeader(buf, op, keyLen, 8, 0, bodyLen, casid)
-	copy(buf[32:], item.Key)
 	binary.BigEndian.PutUint32(buf[24:28], item.Flags)
 	binary.BigEndian.PutUint32(buf[28:32], *(*uint32)(unsafe.Pointer(&item.Expiration)))
-	copy(buf[32:], item.Key)
-	if _, err := c.conn.Write(buf); err != nil {
+	if _, err := c.rw.Write(buf); err != nil {
 		return err
 	}
-	if _, err := c.conn.Write(item.Value); err != nil {
+	if _, err := c.rw.WriteString(item.Key); err != nil {
+		return err
+	}
+	if _, err := c.rw.Write(item.Value); err != nil {
+		return err
+	}
+	if err := c.rw.Flush(); err != nil {
 		return err
 	}
 
@@ -271,13 +285,15 @@ func (c *Conn) CompareAndSwap(item *Item) error {
 
 func (c *Conn) Delete(key string) error {
 	var (
-		buf     = make([]byte, 24+len(key))
+		buf     = make([]byte, 24)
 		keyLen  = uint16(len(key))
 		bodyLen = uint32(len(key))
 	)
 	writeHeader(buf, opDelete, keyLen, 0, 0, bodyLen, 0)
-	copy(buf[24:], key)
-	if _, err := c.conn.Write(buf); err != nil {
+	if _, err := c.rw.Write(buf); err != nil {
+		return err
+	}
+	if _, err := c.rw.WriteString(key); err != nil {
 		return err
 	}
 
@@ -293,7 +309,7 @@ func (c *Conn) Delete(key string) error {
 
 func (c *Conn) incrOrDecr(op byte, key string, delta uint64, initialValue uint64, expiration int) (newValue uint64, err error) {
 	var (
-		buf     = make([]byte, 24+20+len(key))
+		buf     = make([]byte, 24+20)
 		keyLen  = uint16(len(key))
 		bodyLen = uint32(20 + len(key))
 	)
@@ -301,7 +317,13 @@ func (c *Conn) incrOrDecr(op byte, key string, delta uint64, initialValue uint64
 	binary.BigEndian.PutUint64(buf, delta)
 	binary.BigEndian.PutUint64(buf, initialValue)
 	binary.BigEndian.PutUint32(buf, uint32(expiration))
-	if _, err = c.conn.Write(buf); err != nil {
+	if _, err = c.rw.Write(buf); err != nil {
+		return
+	}
+	if _, err = c.rw.WriteString(key); err != nil {
+		return
+	}
+	if err = c.rw.Flush(); err != nil {
 		return
 	}
 
@@ -329,7 +351,10 @@ func (c *Conn) Flush(expiration int) error {
 	buf := make([]byte, 24+4)
 	writeHeader(buf, opFlush, 0, 4, 0, 0, 0)
 	binary.BigEndian.PutUint32(buf, uint32(expiration))
-	if _, err := c.conn.Write(buf); err != nil {
+	if _, err := c.rw.Write(buf); err != nil {
+		return err
+	}
+	if err := c.rw.Flush(); err != nil {
 		return err
 	}
 

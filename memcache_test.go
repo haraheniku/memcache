@@ -14,12 +14,12 @@ func TestMemache(t *testing.T) {
 		Key:   "hoge",
 		Value: []byte("hoge"),
 	}); err != nil {
-		t.Fatal(err)
+		t.Fatalf("got error on set; %v", err)
 	}
 
 	item, err := conn.Get("hoge")
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("got error on get; %v", err)
 	}
 	if item.Key != "hoge" {
 		t.Errorf("expected %q but got %q", "hoge", item.Key)
