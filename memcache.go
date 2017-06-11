@@ -13,6 +13,9 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
+// Credits to:
+// https://github.com/bradfitz/gomemcache/blob/master/memcache/memcache.go
+
 // Similar to:
 // http://code.google.com/appengine/docs/go/memcache/reference.html
 
