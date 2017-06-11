@@ -6,18 +6,15 @@ import (
 )
 
 func TestMemache(t *testing.T) {
-	conn, err := Connect("tcp", "127.0.0.1:11211")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := conn.Set(&Item{
+	cli := New("127.0.0.1:11211")
+	if err := cli.Set(&Item{
 		Key:   "hoge",
 		Value: []byte("hoge"),
 	}); err != nil {
 		t.Fatalf("got error on set; %v", err)
 	}
 
-	item, err := conn.Get("hoge")
+	item, err := cli.Get("hoge")
 	if err != nil {
 		t.Fatalf("got error on get; %v", err)
 	}
@@ -28,7 +25,7 @@ func TestMemache(t *testing.T) {
 		t.Errorf("expected %#v but got %#v", expected, item.Value)
 	}
 
-	items, err := conn.GetMulti([]string{"hoge", "niku", "fuga"})
+	items, err := cli.GetMulti([]string{"hoge", "niku", "fuga"})
 	if err != nil {
 		t.Errorf("got error on get_mutli; %v", err)
 	}

@@ -5,9 +5,12 @@ import (
 	"bufio"
 	"encoding/binary"
 	"errors"
+	"hash/crc32"
 	"io"
 	"net"
 	"unsafe"
+
+	"golang.org/x/sync/errgroup"
 )
 
 // Similar to:
@@ -111,6 +114,157 @@ const (
 	opSetQ
 )
 
+type Client struct {
+	servers []string
+}
+
+func New(servers ...string) *Client {
+	return &Client{servers}
+}
+
+func (c *Client) pickServer(key string) string {
+	h := crc32.ChecksumIEEE(*(*[]byte)(unsafe.Pointer(&key)))
+	return c.servers[int(h)%len(c.servers)]
+}
+
+func (c *Client) getConnWithKey(key string) (*Conn, error) {
+	return c.getConn(c.pickServer(key))
+}
+
+func (c *Client) getConn(addr string) (*Conn, error) {
+	return Connect("tcp", addr)
+}
+
+func (c *Client) putConn(conn *Conn) error {
+	return conn.Close()
+}
+
+func (c *Client) Get(key string) (*Item, error) {
+	conn, err := c.getConnWithKey(key)
+	if err != nil {
+		return nil, err
+	}
+	defer c.putConn(conn)
+
+	return conn.Get(key)
+}
+
+func (c *Client) GetMulti(keys []string) (map[string]*Item, error) {
+	bins := make(map[string][]string)
+	for _, key := range keys {
+		addr := c.pickServer(key)
+		bins[addr] = append(bins[addr], key)
+	}
+
+	var g errgroup.Group
+	result := make([]map[string]*Item, len(c.servers))
+	for i, addr := range c.servers {
+		i, addr := i, addr
+		g.Go(func() error {
+			conn, err := c.getConn(addr)
+			if err != nil {
+				return err
+			}
+			defer c.putConn(conn)
+
+			items, err := conn.GetMulti(bins[addr])
+			if err != nil {
+				return err
+			}
+			result[i] = items
+			return nil
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return nil, err
+	}
+
+	items := make(map[string]*Item)
+	for _, m := range result {
+		for key, item := range m {
+			items[key] = item
+		}
+	}
+	return items, nil
+}
+
+func (c *Client) Set(item *Item) error {
+	conn, err := c.getConnWithKey(item.Key)
+	if err != nil {
+		return err
+	}
+	defer c.putConn(conn)
+
+	return conn.Set(item)
+}
+
+func (c *Client) Add(item *Item) error {
+	conn, err := c.getConnWithKey(item.Key)
+	if err != nil {
+		return err
+	}
+	defer c.putConn(conn)
+
+	return conn.Add(item)
+}
+
+func (c *Client) Replace(item *Item) error {
+	conn, err := c.getConnWithKey(item.Key)
+	if err != nil {
+		return err
+	}
+	defer c.putConn(conn)
+
+	return conn.Replace(item)
+}
+
+func (c *Client) CompareAndSwap(item *Item) error {
+	conn, err := c.getConnWithKey(item.Key)
+	if err != nil {
+		return err
+	}
+	defer c.putConn(conn)
+
+	return conn.CompareAndSwap(item)
+}
+
+func (c *Client) Increment(key string, delta uint64, initialValue uint64, expiration int) (uint64, error) {
+	conn, err := c.getConnWithKey(key)
+	if err != nil {
+		return 0, err
+	}
+	defer c.putConn(conn)
+
+	return conn.Increment(key, delta, initialValue, expiration)
+}
+
+func (c *Client) Decrement(key string, delta uint64, initialValue uint64, expiration int) (uint64, error) {
+	conn, err := c.getConnWithKey(key)
+	if err != nil {
+		return 0, err
+	}
+	defer c.putConn(conn)
+
+	return conn.Decrement(key, delta, initialValue, expiration)
+
+}
+
+func (c *Client) Flush(expiration int) error {
+	var g errgroup.Group
+	for _, server := range c.servers {
+		addr := server
+		g.Go(func() error {
+			conn, err := c.getConn(addr)
+			if err != nil {
+				return err
+			}
+			return conn.Flush(expiration)
+		})
+	}
+
+	return g.Wait()
+}
+
 // Conn is a network connection to memcached.
 type Conn struct {
 	rw   *bufio.ReadWriter
@@ -122,14 +276,18 @@ func Connect(network, addr string) (*Conn, error) {
 	if err != nil {
 		return nil, err
 	}
-	return New(conn), nil
+	return NewConn(conn), nil
 }
 
-func New(conn net.Conn) *Conn {
+func NewConn(conn net.Conn) *Conn {
 	return &Conn{
 		rw:   bufio.NewReadWriter(bufio.NewReader(conn), bufio.NewWriter(conn)),
 		conn: conn,
 	}
+}
+
+func (c *Conn) Close() error {
+	return c.conn.Close()
 }
 
 func setHeader(buf []byte, opcode byte, keyLen int, extraLen int,
@@ -309,6 +467,18 @@ func (c *Conn) GetMulti(keys []string) (map[string]*Item, error) {
 	return result, nil
 }
 
+func (c *Conn) Set(item *Item) error {
+	return c.set(opSet, false, item)
+}
+
+func (c *Conn) Add(item *Item) error {
+	return c.set(opAdd, false, item)
+}
+
+func (c *Conn) Replace(item *Item) error {
+	return c.set(opReplace, false, item)
+}
+
 func (c *Conn) set(opcode byte, cas bool, item *Item) error {
 	if !isValidKey(item.Key) {
 		return ErrMalformedKey
@@ -345,18 +515,6 @@ func (c *Conn) set(opcode byte, cas bool, item *Item) error {
 	return nil
 }
 
-func (c *Conn) Set(item *Item) error {
-	return c.set(opSet, false, item)
-}
-
-func (c *Conn) Add(item *Item) error {
-	return c.set(opAdd, false, item)
-}
-
-func (c *Conn) Replace(item *Item) error {
-	return c.set(opReplace, false, item)
-}
-
 func (c *Conn) CompareAndSwap(item *Item) error {
 	return c.set(opSet, false, item)
 }
@@ -383,6 +541,14 @@ func (c *Conn) Delete(key string) error {
 		return r.statusError()
 	}
 	return nil
+}
+
+func (c *Conn) Increment(key string, delta uint64, initialValue uint64, expiration int) (newValue uint64, err error) {
+	return c.incrOrDecr(opIncrement, key, delta, initialValue, expiration)
+}
+
+func (c *Conn) Decrement(key string, delta uint64, initialValue uint64, expiration int) (newValue uint64, err error) {
+	return c.incrOrDecr(opDecrement, key, delta, initialValue, expiration)
 }
 
 func (c *Conn) incrOrDecr(opcode byte, key string, delta uint64, initialValue uint64, expiration int) (newValue uint64, err error) {
@@ -419,14 +585,6 @@ func (c *Conn) incrOrDecr(opcode byte, key string, delta uint64, initialValue ui
 	}
 	newValue = binary.BigEndian.Uint64(r.body)
 	return
-}
-
-func (c *Conn) Increment(key string, delta uint64, initialValue uint64, expiration int) (newValue uint64, err error) {
-	return c.incrOrDecr(opIncrement, key, delta, initialValue, expiration)
-}
-
-func (c *Conn) Decrement(key string, delta uint64, initialValue uint64, expiration int) (newValue uint64, err error) {
-	return c.incrOrDecr(opDecrement, key, delta, initialValue, expiration)
 }
 
 func (c *Conn) Flush(expiration int) error {
