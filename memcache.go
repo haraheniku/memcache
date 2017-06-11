@@ -132,20 +132,38 @@ func New(conn net.Conn) *Conn {
 	}
 }
 
-func writeHeader(buf []byte, op byte, keyLen uint16, extraLen byte,
-	vbucket uint16, bodyLen uint32, casid uint64) {
-	buf[0] = magicReq                              // magic byte
-	buf[1] = op                                    // opcode
-	binary.BigEndian.PutUint16(buf[2:4], keyLen)   // key length
-	buf[4] = extraLen                              // extra length
-	buf[5] = 0                                     // data type
-	binary.BigEndian.PutUint16(buf[6:8], vbucket)  // vbucket id
-	binary.BigEndian.PutUint32(buf[8:12], bodyLen) // total body length
-	binary.BigEndian.PutUint32(buf[12:16], 0)      // opaque
-	binary.BigEndian.PutUint64(buf[16:24], casid)  // cas
+func setHeader(buf []byte, opcode byte, keyLen int, extraLen int,
+	vbucket uint16, bodyLen int, casid uint64) {
+	buf[0] = magicReq                                      // magic byte
+	buf[1] = opcode                                        // opcode
+	binary.BigEndian.PutUint16(buf[2:4], uint16(keyLen))   // key length
+	buf[4] = byte(extraLen)                                // extra length
+	buf[5] = 0                                             // data type
+	binary.BigEndian.PutUint16(buf[6:8], vbucket)          // vbucket id
+	binary.BigEndian.PutUint32(buf[8:12], uint32(bodyLen)) // total body length
+	binary.BigEndian.PutUint32(buf[12:16], 0)              // opaque
+	binary.BigEndian.PutUint64(buf[16:24], casid)          // cas
+}
+
+func (c *Conn) writeReq(head []byte, key string, value []byte) error {
+	if _, err := c.rw.Write(head); err != nil {
+		return err
+	}
+	if key != "" {
+		if _, err := c.rw.WriteString(key); err != nil {
+			return err
+		}
+	}
+	if len(value) > 0 {
+		if _, err := c.rw.Write(value); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 type resp struct {
+	opcode   byte
 	keyLen   uint16
 	extraLen byte
 	status   uint16
@@ -175,7 +193,7 @@ func (c *Conn) readResp(buf []byte) (r resp, err error) {
 		err = ErrMagicByte
 		return
 	}
-	// opcode := buf[1]
+	r.opcode = buf[1]
 	r.keyLen = binary.BigEndian.Uint16(buf[2:4])
 	r.extraLen = buf[4]
 	// r.dataType := buf[5]
@@ -194,16 +212,9 @@ func (c *Conn) readResp(buf []byte) (r resp, err error) {
 }
 
 func (c *Conn) Get(key string) (*Item, error) {
-	var (
-		buf     = make([]byte, 24)
-		keyLen  = uint16(len(key))
-		bodyLen = uint32(len(key))
-	)
-	writeHeader(buf, opGet, keyLen, 0, 0, bodyLen, 0)
-	if _, err := c.rw.Write(buf); err != nil {
-		return nil, err
-	}
-	if _, err := c.rw.WriteString(key); err != nil {
+	buf := make([]byte, 24)
+	setHeader(buf, opGet, len(key), 0, 0, len(key), 0)
+	if err := c.writeReq(buf, key, nil); err != nil {
 		return nil, err
 	}
 	if err := c.rw.Flush(); err != nil {
@@ -219,9 +230,8 @@ func (c *Conn) Get(key string) (*Item, error) {
 	}
 	kl := int(r.keyLen)
 	el := int(r.extraLen)
-	vpos := kl + el
-	flags := binary.BigEndian.Uint32(r.body[kl:vpos])
-	value := r.body[vpos:]
+	flags := binary.BigEndian.Uint32(r.body[:el])
+	value := r.body[el+kl:]
 	return &Item{
 		Key:   key,
 		Value: value,
@@ -230,26 +240,67 @@ func (c *Conn) Get(key string) (*Item, error) {
 	}, nil
 }
 
-func (c *Conn) set(op byte, cas bool, item *Item) error {
+func (c *Conn) GetMulti(keys []string) (map[string]*Item, error) {
+	buf := make([]byte, 24)
+	for _, key := range keys[:len(keys)-1] {
+		setHeader(buf, opGetKQ, len(key), 0, 0, len(key), 0)
+		if err := c.writeReq(buf, key, nil); err != nil {
+			return nil, err
+		}
+	}
+	key := keys[len(keys)-1]
+	setHeader(buf, opGetK, len(key), 0, 0, len(key), 0)
+	if err := c.writeReq(buf, key, nil); err != nil {
+		return nil, err
+	}
+	if err := c.rw.Flush(); err != nil {
+		return nil, err
+	}
+
+	opcode := -1
+	result := make(map[string]*Item)
+	for opcode != opGetK {
+		r, err := c.readResp(buf)
+		if err != nil {
+			return nil, err
+		}
+		opcode = int(r.opcode)
+		if r.status != statusNoError {
+			if r.status == statusKeyNotFound {
+				continue
+			}
+			return nil, r.statusError()
+		}
+		kl := int(r.keyLen)
+		el := int(r.extraLen)
+		flags := binary.BigEndian.Uint32(r.body[:el])
+		key := string(r.body[el : el+kl])
+		value := r.body[el+kl:]
+		result[key] = &Item{
+			Key:   key,
+			Value: value,
+			Flags: flags,
+			casid: r.casid,
+		}
+	}
+	return result, nil
+}
+
+func (c *Conn) set(opcode byte, cas bool, item *Item) error {
 	var (
-		casid   = uint64(0)
-		buf     = make([]byte, 24+8)
-		keyLen  = uint16(len(item.Key))
-		bodyLen = uint32(8 + len(item.Key) + len(item.Value))
+		casid    = uint64(0)
+		keyLen   = len(item.Key)
+		extraLen = 8
+		bodyLen  = extraLen + len(item.Key) + len(item.Value)
+		buf      = make([]byte, 24+extraLen)
 	)
 	if cas {
 		casid = uint64(item.casid)
 	}
-	writeHeader(buf, op, keyLen, 8, 0, bodyLen, casid)
+	setHeader(buf, opcode, keyLen, extraLen, 0, bodyLen, casid)
 	binary.BigEndian.PutUint32(buf[24:28], item.Flags)
 	binary.BigEndian.PutUint32(buf[28:32], *(*uint32)(unsafe.Pointer(&item.Expiration)))
-	if _, err := c.rw.Write(buf); err != nil {
-		return err
-	}
-	if _, err := c.rw.WriteString(item.Key); err != nil {
-		return err
-	}
-	if _, err := c.rw.Write(item.Value); err != nil {
+	if err := c.writeReq(buf, item.Key, item.Value); err != nil {
 		return err
 	}
 	if err := c.rw.Flush(); err != nil {
@@ -284,16 +335,12 @@ func (c *Conn) CompareAndSwap(item *Item) error {
 }
 
 func (c *Conn) Delete(key string) error {
-	var (
-		buf     = make([]byte, 24)
-		keyLen  = uint16(len(key))
-		bodyLen = uint32(len(key))
-	)
-	writeHeader(buf, opDelete, keyLen, 0, 0, bodyLen, 0)
-	if _, err := c.rw.Write(buf); err != nil {
+	buf := make([]byte, 24)
+	setHeader(buf, opDelete, len(key), 0, 0, len(key), 0)
+	if err := c.writeReq(buf, key, nil); err != nil {
 		return err
 	}
-	if _, err := c.rw.WriteString(key); err != nil {
+	if err := c.rw.Flush(); err != nil {
 		return err
 	}
 
@@ -307,27 +354,26 @@ func (c *Conn) Delete(key string) error {
 	return nil
 }
 
-func (c *Conn) incrOrDecr(op byte, key string, delta uint64, initialValue uint64, expiration int) (newValue uint64, err error) {
+func (c *Conn) incrOrDecr(opcode byte, key string, delta uint64, initialValue uint64, expiration int) (newValue uint64, err error) {
 	var (
-		buf     = make([]byte, 24+20)
-		keyLen  = uint16(len(key))
-		bodyLen = uint32(20 + len(key))
+		keyLen   = len(key)
+		extraLen = 20
+		bodyLen  = extraLen + len(key)
+		buf      = make([]byte, 24+extraLen)
 	)
-	writeHeader(buf, op, keyLen, 4, 0, bodyLen, 0)
+	setHeader(buf, opcode, keyLen, extraLen, 0, bodyLen, 0)
 	binary.BigEndian.PutUint64(buf, delta)
 	binary.BigEndian.PutUint64(buf, initialValue)
 	binary.BigEndian.PutUint32(buf, uint32(expiration))
-	if _, err = c.rw.Write(buf); err != nil {
-		return
-	}
-	if _, err = c.rw.WriteString(key); err != nil {
+	if err = c.writeReq(buf, key, nil); err != nil {
 		return
 	}
 	if err = c.rw.Flush(); err != nil {
 		return
 	}
 
-	r, err := c.readResp(buf)
+	var r resp
+	r, err = c.readResp(buf)
 	if err != nil {
 		return
 	}
@@ -348,10 +394,13 @@ func (c *Conn) Decrement(key string, delta uint64, initialValue uint64, expirati
 }
 
 func (c *Conn) Flush(expiration int) error {
-	buf := make([]byte, 24+4)
-	writeHeader(buf, opFlush, 0, 4, 0, 0, 0)
+	var (
+		extraLen = 4
+		buf      = make([]byte, 24+extraLen)
+	)
+	setHeader(buf, opFlush, 0, extraLen, 0, 0, 0)
 	binary.BigEndian.PutUint32(buf, uint32(expiration))
-	if _, err := c.rw.Write(buf); err != nil {
+	if err := c.writeReq(buf, "", nil); err != nil {
 		return err
 	}
 	if err := c.rw.Flush(); err != nil {

@@ -27,4 +27,23 @@ func TestMemache(t *testing.T) {
 	if expected := []byte("hoge"); !reflect.DeepEqual(expected, item.Value) {
 		t.Errorf("expected %#v but got %#v", expected, item.Value)
 	}
+
+	items, err := conn.GetMulti([]string{"hoge", "niku", "fuga"})
+	if err != nil {
+		t.Errorf("got error on get_mutli; %v", err)
+	}
+	for _, x := range []struct {
+		key   string
+		value []byte
+	}{
+		{"hoge", []byte("hoge")},
+	} {
+		item := items[x.key]
+		if item == nil {
+			t.Errorf("got nil; %v", x)
+		}
+		if item.Key != x.key || !reflect.DeepEqual(x.value, item.Value) {
+			t.Errorf("expected %v but got %s, %v", x, item.Key, item.Value)
+		}
+	}
 }
