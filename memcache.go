@@ -145,6 +145,19 @@ func setHeader(buf []byte, opcode byte, keyLen int, extraLen int,
 	binary.BigEndian.PutUint64(buf[16:24], casid)          // cas
 }
 
+func isValidKey(key string) bool {
+	if len(key) > 250 {
+		return false
+	}
+	for _, c := range key {
+		// [\x21-\x7e\x80-\xff]
+		if c < 0x20 || c == 0x7f {
+			return false
+		}
+	}
+	return true
+}
+
 func (c *Conn) writeReq(head []byte, key string, value []byte) error {
 	if _, err := c.rw.Write(head); err != nil {
 		return err
@@ -212,6 +225,10 @@ func (c *Conn) readResp(buf []byte) (r resp, err error) {
 }
 
 func (c *Conn) Get(key string) (*Item, error) {
+	if !isValidKey(key) {
+		return nil, ErrMalformedKey
+	}
+
 	buf := make([]byte, 24)
 	setHeader(buf, opGet, len(key), 0, 0, len(key), 0)
 	if err := c.writeReq(buf, key, nil); err != nil {
@@ -243,12 +260,18 @@ func (c *Conn) Get(key string) (*Item, error) {
 func (c *Conn) GetMulti(keys []string) (map[string]*Item, error) {
 	buf := make([]byte, 24)
 	for _, key := range keys[:len(keys)-1] {
+		if !isValidKey(key) {
+			return nil, ErrMalformedKey
+		}
 		setHeader(buf, opGetKQ, len(key), 0, 0, len(key), 0)
 		if err := c.writeReq(buf, key, nil); err != nil {
 			return nil, err
 		}
 	}
 	key := keys[len(keys)-1]
+	if !isValidKey(key) {
+		return nil, ErrMalformedKey
+	}
 	setHeader(buf, opGetK, len(key), 0, 0, len(key), 0)
 	if err := c.writeReq(buf, key, nil); err != nil {
 		return nil, err
@@ -287,6 +310,10 @@ func (c *Conn) GetMulti(keys []string) (map[string]*Item, error) {
 }
 
 func (c *Conn) set(opcode byte, cas bool, item *Item) error {
+	if !isValidKey(item.Key) {
+		return ErrMalformedKey
+	}
+
 	var (
 		casid    = uint64(0)
 		keyLen   = len(item.Key)
@@ -335,6 +362,10 @@ func (c *Conn) CompareAndSwap(item *Item) error {
 }
 
 func (c *Conn) Delete(key string) error {
+	if !isValidKey(key) {
+		return ErrMalformedKey
+	}
+
 	buf := make([]byte, 24)
 	setHeader(buf, opDelete, len(key), 0, 0, len(key), 0)
 	if err := c.writeReq(buf, key, nil); err != nil {
@@ -355,6 +386,11 @@ func (c *Conn) Delete(key string) error {
 }
 
 func (c *Conn) incrOrDecr(opcode byte, key string, delta uint64, initialValue uint64, expiration int) (newValue uint64, err error) {
+	if !isValidKey(key) {
+		err = ErrMalformedKey
+		return
+	}
+
 	var (
 		keyLen   = len(key)
 		extraLen = 20
