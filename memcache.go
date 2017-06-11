@@ -479,6 +479,10 @@ func (c *Conn) Replace(item *Item) error {
 	return c.set(opReplace, false, item)
 }
 
+func (c *Conn) CompareAndSwap(item *Item) error {
+	return c.set(opSet, true, item)
+}
+
 func (c *Conn) set(opcode byte, cas bool, item *Item) error {
 	if !isValidKey(item.Key) {
 		return ErrMalformedKey
@@ -513,10 +517,6 @@ func (c *Conn) set(opcode byte, cas bool, item *Item) error {
 	}
 	item.casid = r.casid
 	return nil
-}
-
-func (c *Conn) CompareAndSwap(item *Item) error {
-	return c.set(opSet, false, item)
 }
 
 func (c *Conn) Delete(key string) error {
