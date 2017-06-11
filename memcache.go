@@ -543,11 +543,11 @@ func (c *Conn) Delete(key string) error {
 	return nil
 }
 
-func (c *Conn) Increment(key string, delta uint64, initialValue uint64, expiration int) (newValue uint64, err error) {
+func (c *Conn) Increment(key string, delta uint64, initialValue uint64, expiration int) (uint64, error) {
 	return c.incrOrDecr(opIncrement, key, delta, initialValue, expiration)
 }
 
-func (c *Conn) Decrement(key string, delta uint64, initialValue uint64, expiration int) (newValue uint64, err error) {
+func (c *Conn) Decrement(key string, delta uint64, initialValue uint64, expiration int) (uint64, error) {
 	return c.incrOrDecr(opDecrement, key, delta, initialValue, expiration)
 }
 
