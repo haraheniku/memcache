@@ -141,8 +141,8 @@ type Client struct {
 }
 
 const (
-	defaultMaxOpen = 10
-	defaultMaxIdle = 2
+	defaultMaxOpen = 20
+	defaultMaxIdle = 10
 )
 
 func New(servers ...string) *Client {
@@ -160,8 +160,7 @@ func (c *Client) pickServer(key string) (string, error) {
 	if len(c.servers) == 0 {
 		return "", ErrNoServers
 	}
-
-	h := crc32.ChecksumIEEE(*(*[]byte)(unsafe.Pointer(&key)))
+	h := crc32.ChecksumIEEE([]byte(key))
 	return c.servers[int(h)%len(c.servers)], nil
 }
 
@@ -282,6 +281,16 @@ func (c *Client) store(opcode byte, cas bool, item *Item) error {
 	return conn.store(opcode, cas, item)
 }
 
+func (c *Client) Delete(key string) error {
+	conn, err := c.getConnWithKey(key)
+	if err != nil {
+		return err
+	}
+	defer c.putConn(conn)
+
+	return conn.delete(key)
+}
+
 func (c *Client) Increment(key string, delta uint64, initialValue uint64, expiration int) (uint64, error) {
 	conn, err := c.getConnWithKey(key)
 	if err != nil {
@@ -322,7 +331,7 @@ type conn struct {
 	addr string
 }
 
-func (c *conn) Close() error {
+func (c *conn) close() error {
 	return c.conn.Close()
 }
 

@@ -60,7 +60,7 @@ func (p *pool) putFreeConn(conn *conn) error {
 	if len(p.freeConn) >= p.maxIdle {
 		p.numOpen--
 		p.mu.Unlock()
-		return conn.Close()
+		return conn.close()
 	}
 	p.freeConn = append(p.freeConn, conn)
 	p.mu.Unlock()
