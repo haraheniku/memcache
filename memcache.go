@@ -9,8 +9,6 @@ import (
 	"io"
 	"net"
 	"unsafe"
-
-	"golang.org/x/sync/errgroup"
 )
 
 // Credits to:
@@ -184,27 +182,19 @@ func (c *Client) GetMulti(keys []string) (map[string]*Item, error) {
 		bins[addr] = append(bins[addr], key)
 	}
 
-	var g errgroup.Group
 	result := make([]map[string]*Item, len(c.servers))
 	for i, addr := range c.servers {
-		i, addr := i, addr
-		g.Go(func() error {
-			conn, err := c.getConn(addr)
-			if err != nil {
-				return err
-			}
-			defer c.putConn(conn)
+		conn, err := c.getConn(addr)
+		if err != nil {
+			return nil, err
+		}
+		defer c.putConn(conn)
 
-			items, err := conn.getMulti(bins[addr])
-			if err != nil {
-				return err
-			}
-			result[i] = items
-			return nil
-		})
-	}
-	if err := g.Wait(); err != nil {
-		return nil, err
+		items, err := conn.getMulti(bins[addr])
+		if err != nil {
+			return nil, err
+		}
+		result[i] = items
 	}
 
 	items := make(map[string]*Item)
