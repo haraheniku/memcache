@@ -5,6 +5,7 @@ import (
 	"bufio"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"hash/crc32"
 	"io"
 	"net"
@@ -91,8 +92,27 @@ const (
 	statusNotSupported     = 0x83
 	statusInternalError    = 0x84
 	statusBusy             = 0x85
-	statusTemporaryFailure = 0x85
+	statusTemporaryFailure = 0x86
 )
+
+var statusMessages = map[uint16]string{
+	statusNoError:                "no error",
+	statusKeyNotFound:            "key not found",
+	statusKeyExists:              "key exists",
+	statusValueTooLarge:          "value too large",
+	statusInvalidArguments:       "invalid arguments",
+	statusItemNotStored:          "item not stored",
+	statusInvalidIncrDecr:        "incr/decr on non-numeric value.",
+	statusVBucketError:           "the vbucket belongs to another server",
+	statusAuthenticationError:    "authentication error",
+	statusAuthenticationContinue: "authentication continue",
+	statusUnknownCommand:         "unknown command",
+	statusOutOfMemory:            "out of memory",
+	statusNotSupported:           "not supported",
+	statusInternalError:          "internal error",
+	statusBusy:                   "busy",
+	statusTemporaryFailure:       "temporary failure",
+}
 
 const (
 	opGet = iota
@@ -123,12 +143,20 @@ func New(servers ...string) *Client {
 	return &Client{servers}
 }
 
-func (c *Client) pickServer(key string) string {
+func (c *Client) pickServer(key string) (string, error) {
+	if len(c.servers) == 0 {
+		return "", ErrNoServers
+	}
+
 	h := crc32.ChecksumIEEE(*(*[]byte)(unsafe.Pointer(&key)))
-	return c.servers[int(h)%len(c.servers)]
+	return c.servers[int(h)%len(c.servers)], nil
 }
 func (c *Client) getConnWithKey(key string) (*conn, error) {
-	return c.getConn(c.pickServer(key))
+	addr, err := c.pickServer(key)
+	if err != nil {
+		return nil, err
+	}
+	return c.getConn(addr)
 }
 
 func (c *Client) getConn(addr string) (*conn, error) {
@@ -178,7 +206,10 @@ func (c *Client) GetMulti(keys []string) (map[string]*Item, error) {
 		if !isValidKey(key) {
 			return nil, ErrMalformedKey
 		}
-		addr := c.pickServer(key)
+		addr, err := c.pickServer(key)
+		if err != nil {
+			return nil, err
+		}
 		bins[addr] = append(bins[addr], key)
 	}
 
@@ -315,16 +346,26 @@ type resp struct {
 	body     []byte
 }
 
+type respError struct {
+	status uint16
+}
+
+func (e respError) Error() string {
+	return fmt.Sprintf("memcache: %s", statusMessages[e.status])
+}
+
 func (r *resp) statusError() error {
 	switch r.status {
 	case statusKeyNotFound:
 		return ErrCacheMiss
-	case statusItemNotStored:
-		return ErrNotStored
 	case statusKeyExists:
 		return ErrCASConflict
+	case statusItemNotStored:
+		return ErrNotStored
+	case statusInternalError:
+		return ErrServerError
 	default:
-		panic(r.status)
+		return respError{r.status}
 	}
 }
 
