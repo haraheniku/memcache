@@ -137,10 +137,23 @@ const (
 
 type Client struct {
 	servers []string
+	pools   map[string]*pool
 }
 
+const (
+	defaultMaxOpen = 10
+	defaultMaxIdle = 2
+)
+
 func New(servers ...string) *Client {
-	return &Client{servers}
+	cli := &Client{
+		servers: servers,
+		pools:   make(map[string]*pool),
+	}
+	for _, addr := range servers {
+		cli.pools[addr] = newPool(cli, addr, defaultMaxOpen, defaultMaxIdle)
+	}
+	return cli
 }
 
 func (c *Client) pickServer(key string) (string, error) {
@@ -151,6 +164,7 @@ func (c *Client) pickServer(key string) (string, error) {
 	h := crc32.ChecksumIEEE(*(*[]byte)(unsafe.Pointer(&key)))
 	return c.servers[int(h)%len(c.servers)], nil
 }
+
 func (c *Client) getConnWithKey(key string) (*conn, error) {
 	addr, err := c.pickServer(key)
 	if err != nil {
@@ -160,6 +174,10 @@ func (c *Client) getConnWithKey(key string) (*conn, error) {
 }
 
 func (c *Client) getConn(addr string) (*conn, error) {
+	return c.pools[addr].conn()
+}
+
+func (c *Client) dial(addr string) (*conn, error) {
 	nc, err := net.Dial("tcp", addr)
 	if err != nil {
 		return nil, err
@@ -167,11 +185,12 @@ func (c *Client) getConn(addr string) (*conn, error) {
 	return &conn{
 		rw:   bufio.NewReadWriter(bufio.NewReader(nc), bufio.NewWriter(nc)),
 		conn: nc,
+		addr: addr,
 	}, nil
 }
 
 func (c *Client) putConn(conn *conn) error {
-	return conn.Close()
+	return c.pools[conn.addr].putConn(conn)
 }
 
 func isValidKey(key string) bool {
@@ -300,6 +319,7 @@ func (c *Client) Flush(expiration int) error {
 type conn struct {
 	rw   *bufio.ReadWriter
 	conn net.Conn
+	addr string
 }
 
 func (c *conn) Close() error {

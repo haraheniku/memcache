@@ -13,6 +13,12 @@ func TestMemache(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("got error on set; %v", err)
 	}
+	if err := cli.Set(&Item{
+		Key:   "fuga",
+		Value: []byte("hoge"),
+	}); err != nil {
+		t.Fatalf("got error on set; %v", err)
+	}
 
 	item, err := cli.Get("hoge")
 	if err != nil {
