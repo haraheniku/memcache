@@ -129,32 +129,57 @@ func (c *Client) pickServer(key string) string {
 	h := crc32.ChecksumIEEE(*(*[]byte)(unsafe.Pointer(&key)))
 	return c.servers[int(h)%len(c.servers)]
 }
-
-func (c *Client) getConnWithKey(key string) (*Conn, error) {
+func (c *Client) getConnWithKey(key string) (*conn, error) {
 	return c.getConn(c.pickServer(key))
 }
 
-func (c *Client) getConn(addr string) (*Conn, error) {
-	return Connect("tcp", addr)
+func (c *Client) getConn(addr string) (*conn, error) {
+	nc, err := net.Dial("tcp", addr)
+	if err != nil {
+		return nil, err
+	}
+	return &conn{
+		rw:   bufio.NewReadWriter(bufio.NewReader(nc), bufio.NewWriter(nc)),
+		conn: nc,
+	}, nil
 }
 
-func (c *Client) putConn(conn *Conn) error {
+func (c *Client) putConn(conn *conn) error {
 	return conn.Close()
 }
 
+func isValidKey(key string) bool {
+	if len(key) > 250 {
+		return false
+	}
+	for _, c := range key {
+		// [\x21-\x7e\x80-\xff]
+		if c < 0x20 || c == 0x7f {
+			return false
+		}
+	}
+	return true
+}
+
 func (c *Client) Get(key string) (*Item, error) {
+	if !isValidKey(key) {
+		return nil, ErrMalformedKey
+	}
 	conn, err := c.getConnWithKey(key)
 	if err != nil {
 		return nil, err
 	}
 	defer c.putConn(conn)
 
-	return conn.Get(key)
+	return conn.get(key)
 }
 
 func (c *Client) GetMulti(keys []string) (map[string]*Item, error) {
 	bins := make(map[string][]string)
 	for _, key := range keys {
+		if !isValidKey(key) {
+			return nil, ErrMalformedKey
+		}
 		addr := c.pickServer(key)
 		bins[addr] = append(bins[addr], key)
 	}
@@ -170,7 +195,7 @@ func (c *Client) GetMulti(keys []string) (map[string]*Item, error) {
 			}
 			defer c.putConn(conn)
 
-			items, err := conn.GetMulti(bins[addr])
+			items, err := conn.getMulti(bins[addr])
 			if err != nil {
 				return err
 			}
@@ -192,43 +217,29 @@ func (c *Client) GetMulti(keys []string) (map[string]*Item, error) {
 }
 
 func (c *Client) Set(item *Item) error {
-	conn, err := c.getConnWithKey(item.Key)
-	if err != nil {
-		return err
-	}
-	defer c.putConn(conn)
-
-	return conn.Set(item)
+	return c.store(opSet, false, item)
 }
 
 func (c *Client) Add(item *Item) error {
-	conn, err := c.getConnWithKey(item.Key)
-	if err != nil {
-		return err
-	}
-	defer c.putConn(conn)
-
-	return conn.Add(item)
+	return c.store(opSet, false, item)
 }
 
 func (c *Client) Replace(item *Item) error {
-	conn, err := c.getConnWithKey(item.Key)
-	if err != nil {
-		return err
-	}
-	defer c.putConn(conn)
-
-	return conn.Replace(item)
+	return c.store(opSet, false, item)
 }
 
 func (c *Client) CompareAndSwap(item *Item) error {
+	return c.store(opSet, false, item)
+}
+
+func (c *Client) store(opcode byte, cas bool, item *Item) error {
 	conn, err := c.getConnWithKey(item.Key)
 	if err != nil {
 		return err
 	}
 	defer c.putConn(conn)
 
-	return conn.CompareAndSwap(item)
+	return conn.store(opcode, cas, item)
 }
 
 func (c *Client) Increment(key string, delta uint64, initialValue uint64, expiration int) (uint64, error) {
@@ -238,7 +249,7 @@ func (c *Client) Increment(key string, delta uint64, initialValue uint64, expira
 	}
 	defer c.putConn(conn)
 
-	return conn.Increment(key, delta, initialValue, expiration)
+	return conn.incrOrDecr(opIncrement, key, delta, initialValue, expiration)
 }
 
 func (c *Client) Decrement(key string, delta uint64, initialValue uint64, expiration int) (uint64, error) {
@@ -248,48 +259,29 @@ func (c *Client) Decrement(key string, delta uint64, initialValue uint64, expira
 	}
 	defer c.putConn(conn)
 
-	return conn.Decrement(key, delta, initialValue, expiration)
-
+	return conn.incrOrDecr(opDecrement, key, delta, initialValue, expiration)
 }
 
 func (c *Client) Flush(expiration int) error {
-	var g errgroup.Group
-	for _, server := range c.servers {
-		addr := server
-		g.Go(func() error {
-			conn, err := c.getConn(addr)
-			if err != nil {
-				return err
-			}
-			return conn.Flush(expiration)
-		})
+	for _, addr := range c.servers {
+		conn, err := c.getConn(addr)
+		if err != nil {
+			return err
+		}
+		if err := conn.flush(expiration); err != nil {
+			return err
+		}
 	}
-
-	return g.Wait()
+	return nil
 }
 
-// Conn is a network connection to memcached.
-type Conn struct {
+// conn is a network connection to memcached.
+type conn struct {
 	rw   *bufio.ReadWriter
 	conn net.Conn
 }
 
-func Connect(network, addr string) (*Conn, error) {
-	conn, err := net.Dial(network, addr)
-	if err != nil {
-		return nil, err
-	}
-	return NewConn(conn), nil
-}
-
-func NewConn(conn net.Conn) *Conn {
-	return &Conn{
-		rw:   bufio.NewReadWriter(bufio.NewReader(conn), bufio.NewWriter(conn)),
-		conn: conn,
-	}
-}
-
-func (c *Conn) Close() error {
+func (c *conn) Close() error {
 	return c.conn.Close()
 }
 
@@ -306,20 +298,7 @@ func setHeader(buf []byte, opcode byte, keyLen int, extraLen int,
 	binary.BigEndian.PutUint64(buf[16:24], casid)          // cas
 }
 
-func isValidKey(key string) bool {
-	if len(key) > 250 {
-		return false
-	}
-	for _, c := range key {
-		// [\x21-\x7e\x80-\xff]
-		if c < 0x20 || c == 0x7f {
-			return false
-		}
-	}
-	return true
-}
-
-func (c *Conn) writeReq(head []byte, key string, value []byte) error {
+func (c *conn) writeReq(head []byte, key string, value []byte) error {
 	if _, err := c.rw.Write(head); err != nil {
 		return err
 	}
@@ -359,7 +338,7 @@ func (r *resp) statusError() error {
 	}
 }
 
-func (c *Conn) readResp(buf []byte) (r resp, err error) {
+func (c *conn) readResp(buf []byte) (r resp, err error) {
 	if _, err = io.ReadAtLeast(c.rw, buf[:24], 24); err != nil {
 		return
 	}
@@ -385,11 +364,7 @@ func (c *Conn) readResp(buf []byte) (r resp, err error) {
 	return
 }
 
-func (c *Conn) Get(key string) (*Item, error) {
-	if !isValidKey(key) {
-		return nil, ErrMalformedKey
-	}
-
+func (c *conn) get(key string) (*Item, error) {
 	buf := make([]byte, 24)
 	setHeader(buf, opGet, len(key), 0, 0, len(key), 0)
 	if err := c.writeReq(buf, key, nil); err != nil {
@@ -418,21 +393,15 @@ func (c *Conn) Get(key string) (*Item, error) {
 	}, nil
 }
 
-func (c *Conn) GetMulti(keys []string) (map[string]*Item, error) {
+func (c *conn) getMulti(keys []string) (map[string]*Item, error) {
 	buf := make([]byte, 24)
 	for _, key := range keys[:len(keys)-1] {
-		if !isValidKey(key) {
-			return nil, ErrMalformedKey
-		}
 		setHeader(buf, opGetKQ, len(key), 0, 0, len(key), 0)
 		if err := c.writeReq(buf, key, nil); err != nil {
 			return nil, err
 		}
 	}
 	key := keys[len(keys)-1]
-	if !isValidKey(key) {
-		return nil, ErrMalformedKey
-	}
 	setHeader(buf, opGetK, len(key), 0, 0, len(key), 0)
 	if err := c.writeReq(buf, key, nil); err != nil {
 		return nil, err
@@ -470,27 +439,7 @@ func (c *Conn) GetMulti(keys []string) (map[string]*Item, error) {
 	return result, nil
 }
 
-func (c *Conn) Set(item *Item) error {
-	return c.set(opSet, false, item)
-}
-
-func (c *Conn) Add(item *Item) error {
-	return c.set(opAdd, false, item)
-}
-
-func (c *Conn) Replace(item *Item) error {
-	return c.set(opReplace, false, item)
-}
-
-func (c *Conn) CompareAndSwap(item *Item) error {
-	return c.set(opSet, true, item)
-}
-
-func (c *Conn) set(opcode byte, cas bool, item *Item) error {
-	if !isValidKey(item.Key) {
-		return ErrMalformedKey
-	}
-
+func (c *conn) store(opcode byte, cas bool, item *Item) error {
 	var (
 		casid    = uint64(0)
 		keyLen   = len(item.Key)
@@ -522,11 +471,7 @@ func (c *Conn) set(opcode byte, cas bool, item *Item) error {
 	return nil
 }
 
-func (c *Conn) Delete(key string) error {
-	if !isValidKey(key) {
-		return ErrMalformedKey
-	}
-
+func (c *conn) delete(key string) error {
 	buf := make([]byte, 24)
 	setHeader(buf, opDelete, len(key), 0, 0, len(key), 0)
 	if err := c.writeReq(buf, key, nil); err != nil {
@@ -546,20 +491,7 @@ func (c *Conn) Delete(key string) error {
 	return nil
 }
 
-func (c *Conn) Increment(key string, delta uint64, initialValue uint64, expiration int) (uint64, error) {
-	return c.incrOrDecr(opIncrement, key, delta, initialValue, expiration)
-}
-
-func (c *Conn) Decrement(key string, delta uint64, initialValue uint64, expiration int) (uint64, error) {
-	return c.incrOrDecr(opDecrement, key, delta, initialValue, expiration)
-}
-
-func (c *Conn) incrOrDecr(opcode byte, key string, delta uint64, initialValue uint64, expiration int) (newValue uint64, err error) {
-	if !isValidKey(key) {
-		err = ErrMalformedKey
-		return
-	}
-
+func (c *conn) incrOrDecr(opcode byte, key string, delta uint64, initialValue uint64, expiration int) (newValue uint64, err error) {
 	var (
 		keyLen   = len(key)
 		extraLen = 20
@@ -590,7 +522,7 @@ func (c *Conn) incrOrDecr(opcode byte, key string, delta uint64, initialValue ui
 	return
 }
 
-func (c *Conn) Flush(expiration int) error {
+func (c *conn) flush(expiration int) error {
 	var (
 		extraLen = 4
 		buf      = make([]byte, 24+extraLen)
